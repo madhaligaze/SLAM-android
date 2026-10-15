@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- те же цвета, что у веб-версии -->
+    <color name="bg">#FF0E151D</color>
+    <color name="accent">#FF2FA566</color>
+    <color name="blue">#FF3A7BD5</color>
+</resources>
