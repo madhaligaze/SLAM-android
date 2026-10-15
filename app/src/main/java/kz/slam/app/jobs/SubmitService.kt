@@ -22,133 +22,179 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kz.slam.app.MainActivity
 import kz.slam.app.R
+import kz.slam.app.data.Api
+import kz.slam.app.data.ApiException
+import kz.slam.app.data.JobEntity
+import kz.slam.app.data.JobFieldsEntity
+import kz.slam.app.data.Repo
+import kz.slam.app.data.WorkerResult
 import kz.slam.app.engine.FillResult
 import kz.slam.app.engine.FormBrowser
 import kz.slam.app.engine.SlamEngine
 import kz.slam.app.engine.WorkerData
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 
-/** Что отправить: общие данные бригады + список ФИО. */
+/** Что отправить: бригада, её данные на сегодня и список ФИО. */
 data class JobRequest(
-    val brigade: String,
+    val brigadeId: String,
+    val serverBlockId: Int?,
+    val brigadeName: String,
     val names: List<String>,
     val workplace: String,
     val task: String,
     val objectKey: String,
     val company: String,
-    val submit: Boolean,
+    val submit: Boolean = true,
 )
-
-data class WorkerResult(
-    val fullName: String,
-    val status: String = "pending",       // pending | running | ok | unconfirmed | failed
-    val submitted: Boolean = false,
-    val elapsed: Double = 0.0,
-    val errors: List<String> = emptyList(),
-    val warnings: List<String> = emptyList(),
-    val steps: List<String> = emptyList(),
-    val fieldsTotal: Int = 0,
-    val fieldsVerified: Int = 0,
-)
-
-data class JobState(
-    val request: JobRequest,
-    val status: String,                   // running | done | error
-    val results: List<WorkerResult>,
-    val startedAt: Long,
-    val finishedAt: Long? = null,
-) {
-    val done get() = results.count { it.status !in setOf("pending", "running") }
-    val total get() = results.size
-    val active get() = status == "running"
-}
 
 /**
- * Отправка бригады. Foreground-служба с уведомлением: Android не убивает
- * процесс, пока она идёт, и бригадир может свернуть приложение или
- * заблокировать телефон — формы продолжают уходить.
+ * Отправка бригад. Foreground-служба с уведомлением: Android не убивает
+ * процесс, пока она идёт — бригадир может свернуть приложение или убрать
+ * телефон, формы продолжают уходить.
+ *
+ * Очередь — это записи jobs со статусом queued в базе: можно поставить
+ * несколько бригад подряд, они пройдут по одной (браузер один).
  */
 class SubmitService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var wakeLock: PowerManager.WakeLock? = null
+    private var loop: kotlinx.coroutines.Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val req = pending ?: run { stopSelf(); return START_NOT_STICKY }
-        pending = null
         ensureChannel(this)
         ServiceCompat.startForeground(
-            this, NOTIF_ID, progressNotification(req.brigade, 0, req.names.size),
+            this, NOTIF_ID, notification("Подготовка…", 0, 0, ongoing = true),
             if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC else 0,
         )
-        wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
-            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "slam:submit")
-            .apply { acquire(60 * 60 * 1000L) }
-        scope.launch { runJob(req) }
+        if (wakeLock == null) {
+            wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "slam:submit")
+                .apply { acquire(2 * 60 * 60 * 1000L) }
+        }
+        if (loop?.isActive != true) loop = scope.launch { runQueue() }
         return START_NOT_STICKY
     }
 
-    private suspend fun runJob(req: JobRequest) {
-        _state.value = JobState(req, "running", req.names.map { WorkerResult(it) }, System.currentTimeMillis())
-        Log.i(TAG, "JOB_START " + JSONObject().put("total", req.names.size).put("submit", req.submit))
+    private suspend fun runQueue() {
+        _running.value = true
         val browser = FormBrowser(this)
-        var crashed: Throwable? = null
         try {
             browser.start()
             val engine = SlamEngine(browser)
-            for ((i, name) in req.names.withIndex()) {
-                setResult(i) { it.copy(status = "running") }
-                val res = engine.fillOne(
-                    WorkerData(name, req.workplace, req.task, req.objectKey, req.company), req.submit)
-                setResult(i) { res.toWorkerResult(name) }
-                logResult(req, i, res)
-                notifyProgress(req.brigade, i + 1, req.names.size)
+            while (true) {
+                val job = Repo.db.jobs().active().firstOrNull { it.status == "queued" } ?: break
+                runJob(job, engine)
             }
         } catch (e: Throwable) {
-            crashed = e
-            Log.e(TAG, "job crashed", e)
+            Log.e(TAG, "queue crashed", e)
+            // Всё, что не доделано, честно помечаем — иначе висело бы «идёт отправка».
+            Repo.recoverInterrupted()
         } finally {
             runCatching { browser.stop() }
+            _running.value = false
+            wakeLock?.let { if (it.isHeld) it.release() }
+            wakeLock = null
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            Repo.requestSync(0)
         }
-        _state.update { s ->
-            s?.copy(
-                status = if (crashed == null) "done" else "error",
-                finishedAt = System.currentTimeMillis(),
-                results = s.results.map {
-                    if (it.status in setOf("pending", "running"))
-                        it.copy(status = "failed", errors = it.errors + "Отправка прервана: ${crashed?.message}")
-                    else it
-                },
-            )
-        }
-        finish()
     }
 
-    private fun setResult(i: Int, f: (WorkerResult) -> WorkerResult) {
-        _state.update { s -> s?.copy(results = s.results.mapIndexed { j, r -> if (j == i) f(r) else r }) }
+    private suspend fun runJob(queued: JobEntity, engine: SlamEngine) {
+        var job = queued.copy(status = "running", startedAt = System.currentTimeMillis())
+        save(job)
+        Log.i(TAG, "JOB_START " + JSONObject().put("id", job.id).put("total", job.total).put("submit", job.submit))
+
+        // Сначала — отметка на сервере: другие бригадиры увидят, что бригада
+        // отправляется, а сервер не даст запустить её второй раз.
+        var reporter: Api? = null
+        val blockId = job.serverBlockId
+        if (blockId != null) {
+            try {
+                val api = Repo.api()
+                withTimeoutOrNull(15_000) {
+                    api.phoneJobStart(blockId, job.id, job.results.map { it.fullName }, job.submit, Repo.baseOf(job))
+                } ?: throw java.io.IOException("timeout")
+                job = job.copy(onServer = true)
+                reporter = api
+            } catch (e: ApiException) {
+                if (e.status == 409) {
+                    val why = "Не отправлялось: по этой бригаде уже идёт отправка — с другого телефона или из веб-версии."
+                    job = job.copy(status = "error", finishedAt = System.currentTimeMillis(), reported = true,
+                        note = "По этой бригаде уже идёт отправка с другого устройства. Дождитесь её окончания.",
+                        results = job.results.map { it.copy(status = "failed", errors = listOf(why)) })
+                    save(job)
+                    logDone(job)
+                    return
+                }
+                job = job.copy(note = "Сервер не принял отметку (${e.message}) — формы отправляются без неё.")
+            } catch (e: Exception) {
+                job = job.copy(note = "Нет связи с сервером — другие бригадиры увидят эту отправку, когда связь появится.")
+            }
+            save(job)
+        }
+
+        for (i in job.results.indices) {
+            if (job.id in stopRequested) {
+                job = job.copy(results = job.results.mapIndexed { j, r ->
+                    if (j >= i) r.copy(status = "failed", errors = r.errors + "Не отправлялось: отправку остановили.") else r
+                }, note = "Отправку остановили вручную.")
+                break
+            }
+            job = job.withResult(i) { it.copy(status = "running") }
+            save(job)
+            notifyProgress(job)
+            reporter = report(reporter, job)
+
+            val name = job.results[i].fullName
+            val res = engine.fillOne(WorkerData(name, job.workplace, job.task, job.objectKey, job.company), job.submit)
+            Repo.db.jobs().upsertFields(JobFieldsEntity(job.id, i, res.fields.toList()))
+            job = job.withResult(i) { res.toWorkerResult(name) }
+            save(job)
+            logResult(i, name, res)
+            reporter = report(reporter, job)
+        }
+        stopRequested.remove(job.id)
+        job = job.copy(status = "done", finishedAt = System.currentTimeMillis())
+        save(job)
+        notifyProgress(job)
+
+        // Итог с протоколом полей — на сервер; не вышло — передаст синхронизация.
+        if (reporter != null) {
+            try {
+                val fields = Repo.db.jobs().allFields(job.id).associate { it.idx to it.fields }
+                withTimeoutOrNull(30_000) {
+                    reporter.phoneJobUpdate(job.id, job.status, job.done, job.results,
+                        job.results.indices.map { fields[it] ?: emptyList() }, Repo.iso(job.finishedAt))
+                    true
+                }?.let { job = job.copy(reported = true); save(job) }
+            } catch (e: Exception) {
+                Log.w(TAG, "final report failed: $e")
+            }
+        }
+        notifyDone(job)
+        logDone(job)
     }
 
-    private fun finish() {
-        val s = _state.value
-        val nm = getSystemService(NotificationManager::class.java)
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        if (s != null) {
-            val sent = s.results.count { it.submitted }
-            val bad = s.results.count { it.status == "failed" || it.status == "unconfirmed" }
-            val text = if (s.request.submit) "Отправлено $sent из ${s.total}" + (if (bad > 0) ", проблем: $bad" else "")
-            else "Проверено ${s.done} из ${s.total} (без отправки)"
-            nm.notify(DONE_NOTIF_ID, baseNotification("«${s.request.brigade}»: $text").setAutoCancel(true).build())
-            Log.i(TAG, "JOB_DONE " + JSONObject().put("status", s.status).put("sent", sent).put("bad", bad))
+    /** Ход отправки — на сервер. Сеть подвела — дальше не пытаемся, итог передаст синхронизация. */
+    private suspend fun report(api: Api?, job: JobEntity): Api? {
+        if (api == null) return null
+        return try {
+            withTimeoutOrNull(8_000) { api.phoneJobUpdate(job.id, "running", job.done, job.results, null, null); api }
+        } catch (e: Exception) {
+            null
         }
-        wakeLock?.let { if (it.isHeld) it.release() }
-        stopSelf()
     }
+
+    private suspend fun save(job: JobEntity) = Repo.db.jobs().upsert(job)
 
     override fun onDestroy() {
         scope.cancel()
@@ -156,28 +202,47 @@ class SubmitService : Service() {
         super.onDestroy()
     }
 
-    private fun notifyProgress(brigade: String, done: Int, total: Int) {
-        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, progressNotification(brigade, done, total))
+    // ---------- уведомления ----------
+
+    private fun notifyProgress(job: JobEntity) {
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.notify(NOTIF_ID, notification("«${job.brigadeName}»: ${job.done} из ${job.total}", job.done, job.total, ongoing = true))
     }
 
-    private fun progressNotification(brigade: String, done: Int, total: Int): Notification =
-        baseNotification("«$brigade»: $done из $total")
-            .setOngoing(true)
-            .setProgress(total, done, false)
-            .build()
+    private fun notifyDone(job: JobEntity) {
+        val bad = job.failed + job.unconfirmed
+        val text = when {
+            !job.submit -> "«${job.brigadeName}»: проверено ${job.done} из ${job.total}, без отправки"
+            bad == 0 -> "«${job.brigadeName}»: отправлено ${job.sent} из ${job.total}"
+            else -> "«${job.brigadeName}»: отправлено ${job.sent} из ${job.total}, проблем: $bad"
+        }
+        getSystemService(NotificationManager::class.java)
+            .notify(job.id.hashCode(), notification(text, 0, 0, ongoing = false, brigadeId = job.brigadeId))
+    }
 
-    private fun baseNotification(text: String) = NotificationCompat.Builder(this, CHANNEL)
-        .setSmallIcon(R.drawable.ic_notification)
-        .setContentTitle("SLAM — отправка")
-        .setContentText(text)
-        .setOnlyAlertOnce(true)
-        .setContentIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
+    private fun notification(text: String, done: Int, total: Int, ongoing: Boolean, brigadeId: String? = null): Notification {
+        val open = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            brigadeId?.let { putExtra(MainActivity.EXTRA_BRIGADE, it) }
+        }
+        val b = NotificationCompat.Builder(this, if (ongoing) CHANNEL else CHANNEL_DONE)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(if (ongoing) "SLAM — идёт отправка" else "SLAM — отправка завершена")
+            .setContentText(text)
+            .setOnlyAlertOnce(true)
+            .setOngoing(ongoing)
+            .setAutoCancel(!ongoing)
+            .setContentIntent(PendingIntent.getActivity(this, brigadeId.hashCode(), open,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
+        if (ongoing && total > 0) b.setProgress(total, done, false)
+        return b.build()
+    }
 
-    /** Строка в logcat для автотестов: по ней видно итог без экрана. */
-    private fun logResult(req: JobRequest, i: Int, r: FillResult) {
+    // ---------- строки в logcat для автотестов ----------
+
+    private fun logResult(i: Int, name: String, r: FillResult) {
         val o = JSONObject()
-            .put("i", i).put("name", req.names[i]).put("status", r.status).put("submitted", r.submitted)
+            .put("i", i).put("name", name).put("status", r.status).put("submitted", r.submitted)
             .put("elapsed", r.elapsed)
             .put("verified", r.fields.count { it.verified }).put("fields", r.fields.size)
             .put("errors", JSONArray(r.errors)).put("warnings", JSONArray(r.warnings))
@@ -185,31 +250,50 @@ class SubmitService : Service() {
         Log.i(TAG, "RESULT $o")
     }
 
+    private fun logDone(job: JobEntity) {
+        Log.i(TAG, "JOB_DONE " + JSONObject().put("id", job.id).put("status", job.status).put("sent", job.sent)
+            .put("bad", job.failed + job.unconfirmed).put("onServer", job.onServer).put("reported", job.reported)
+            .put("note", job.note))
+    }
+
     companion object {
         const val TAG = "SLAM"
-        private const val CHANNEL = "submit"
+        private const val CHANNEL = "progress"         // ход отправки — тихо
+        private const val CHANNEL_DONE = "done"        // итог — со звуком: телефон, скорее всего, в кармане
         private const val NOTIF_ID = 1
-        private const val DONE_NOTIF_ID = 2
 
-        private val _state = MutableStateFlow<JobState?>(null)
-        val state: StateFlow<JobState?> = _state.asStateFlow()
-        @Volatile private var pending: JobRequest? = null
+        private val _running = MutableStateFlow(false)
+        val running: StateFlow<Boolean> = _running.asStateFlow()
+        private val stopRequested = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
-        fun start(context: Context, req: JobRequest) {
-            if (_state.value?.active == true) return
-            pending = req
+        /** Поставить бригаду в очередь и запустить службу. Возвращает id отправки. */
+        suspend fun enqueue(context: Context, r: JobRequest): String {
+            val id = UUID.randomUUID().toString().replace("-", "")
+            Repo.db.jobs().upsert(JobEntity(
+                id = id, brigadeId = r.brigadeId, brigadeName = r.brigadeName, serverBlockId = r.serverBlockId,
+                status = "queued", submit = r.submit, workplace = r.workplace, task = r.task,
+                objectKey = r.objectKey, company = r.company,
+                results = r.names.map { WorkerResult(it) }, createdAt = System.currentTimeMillis(),
+            ))
             ContextCompat.startForegroundService(context, Intent(context, SubmitService::class.java))
+            return id
         }
+
+        /** Остановить после текущей формы (начатую форму не бросаем на полпути). */
+        fun requestStop(jobId: String) { stopRequested += jobId }
 
         fun ensureChannel(context: Context) {
             val nm = context.getSystemService(NotificationManager::class.java)
-            if (nm.getNotificationChannel(CHANNEL) == null) {
-                nm.createNotificationChannel(
-                    NotificationChannel(CHANNEL, "Отправка SLAM", NotificationManager.IMPORTANCE_LOW))
-            }
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL, "Ход отправки", NotificationManager.IMPORTANCE_LOW))
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL_DONE, "Отправка завершена", NotificationManager.IMPORTANCE_DEFAULT))
         }
     }
 }
+
+private fun JobEntity.withResult(i: Int, f: (WorkerResult) -> WorkerResult) =
+    copy(results = results.mapIndexed { j, r -> if (j == i) f(r) else r })
 
 fun FillResult.toWorkerResult(name: String) = WorkerResult(
     fullName = name, status = status, submitted = submitted, elapsed = elapsed,

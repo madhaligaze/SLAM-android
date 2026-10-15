@@ -1,5 +1,7 @@
 package kz.slam.app.engine
 
+import kotlinx.serialization.Serializable
+
 /** Данные одного работника для одной формы. */
 data class WorkerData(
     val fullName: String,
@@ -10,6 +12,7 @@ data class WorkerData(
 )
 
 /** Одно поле протокола: что реально оказалось в форме. */
+@Serializable
 data class FieldRecord(
     val section: String,
     val q: String,
